@@ -1,6 +1,8 @@
 # meta developer: @puremodules
 # meta description: Поиск NFT-подарков Telegram по NFT, виду, цвету и цене.
 
+__version__ = (1, 0, 1)
+
 import asyncio
 import contextlib
 import math
@@ -22,6 +24,11 @@ def _btn(text: str, emoji_id: int, **kwargs) -> dict:
     button = {"text": text, "emoji_id": str(emoji_id)}
     button.update(kwargs)
     return button
+
+
+def _resale_supports_stars_only() -> bool:
+    code = getattr(functions.payments.GetResaleStarGiftsRequest.__init__, "__code__", None)
+    return bool(code and "stars_only" in code.co_varnames)
 
 
 ID_WORLD = 5445326466067754897
@@ -79,6 +86,7 @@ SCAN_BATCH_SIZE = 8
 DISCOVERY_BATCH_SIZE = 8
 MAX_PAGES_PER_GIFT = 8
 MAX_STORED_RESULTS = 100
+RESALE_SUPPORTS_STARS_ONLY = _resale_supports_stars_only()
 
 
 @loader.tds
@@ -97,7 +105,13 @@ class GiftFinderMod(loader.Module):
 
     async def client_ready(self):
         self._prune_sessions()
+        self._drop_remote_origin()
         self._prime_catalog()
+
+    def _drop_remote_origin(self):
+        loaded = dict(self._db.get("LoaderMod", "loaded_modules", {}) or {})
+        if loaded.pop("GiftFinderMod", None) is not None:
+            self._db.set("LoaderMod", "loaded_modules", loaded)
 
     @loader.command()
     async def snft(self, message: Message):
@@ -1339,7 +1353,10 @@ class GiftFinderMod(loader.Module):
             "limit": RESALE_FETCH_LIMIT,
             "sort_by_price": True,
         }
-        if self._normalize_currency(session.get("currency")) == "stars":
+        if (
+            self._normalize_currency(session.get("currency")) == "stars"
+            and RESALE_SUPPORTS_STARS_ONLY
+        ):
             request_kwargs["stars_only"] = True
 
         attrs = []
