@@ -1,19 +1,24 @@
 # meta developer: @puremodules
-# meta description: Поиск NFT-подарков Telegram по NFT, виду, цвету и цене.
+# meta description: Поиск и заказ NFT-подарков Telegram по NFT, виду, цвету и цене.
+# meta banner: https://raw.githubusercontent.com/pureoffic2/Heroku/refs/heads/main/3833FCB8-ADF2-41C6-A1EF-B4A4A691CEE7.png
 
-__version__ = (1, 0, 1)
+__version__ = (1, 0, 2)
 
 import asyncio
 import contextlib
+import logging
 import math
 import time
 from typing import Dict, List, Optional
 
 from herokutl.tl import functions, types
+from herokutl.tl.custom.button import Button
 from herokutl.tl.types import Message
 
 from .. import loader, utils
 from ..inline.types import InlineCall
+
+logger = logging.getLogger(__name__)
 
 
 def _tg(doc_id: int, fallback: str) -> str:
@@ -24,11 +29,6 @@ def _btn(text: str, emoji_id: int, **kwargs) -> dict:
     button = {"text": text, "emoji_id": str(emoji_id)}
     button.update(kwargs)
     return button
-
-
-def _resale_supports_stars_only() -> bool:
-    code = getattr(functions.payments.GetResaleStarGiftsRequest.__init__, "__code__", None)
-    return bool(code and "stars_only" in code.co_varnames)
 
 
 ID_WORLD = 5445326466067754897
@@ -51,6 +51,10 @@ ID_NEXT = 5445350109862720603
 ID_RESET = 5445005936953424165
 ID_REFRESH = 5445388803223091254
 ID_ANY = 5445210909972655435
+ID_LIST = 5447224884562263112
+ID_ORDER = 5447242579827523388
+ID_CHAT = 5445140257760639304
+ID_DEL = 5445005936953424165
 
 E_WORLD = _tg(ID_WORLD, "🌐")
 E_NFT = _tg(5260681660189408650, "💎")
@@ -71,6 +75,9 @@ E_BACK = _tg(ID_BACK, "⬅️")
 E_NEXT = _tg(ID_NEXT, "➡️")
 E_RESET = _tg(ID_RESET, "🗑")
 E_ANY = _tg(ID_ANY, "☑️")
+E_LIST = _tg(ID_LIST, "➕")
+E_ORDER = _tg(ID_ORDER, "✔️")
+E_CHAT = _tg(ID_CHAT, "💬")
 
 RESULTS_PER_PAGE = 5
 CATALOG_CACHE_TTL = 300
@@ -86,14 +93,23 @@ SCAN_BATCH_SIZE = 8
 DISCOVERY_BATCH_SIZE = 8
 MAX_PAGES_PER_GIFT = 8
 MAX_STORED_RESULTS = 100
-RESALE_SUPPORTS_STARS_ONLY = _resale_supports_stars_only()
+MAX_ORDERS = 10
+SCAN_INTERVAL = 45
 
 
 @loader.tds
 class GiftFinderMod(loader.Module):
-    """Поиск NFT-подарков Telegram по NFT, виду, цвету и цене."""
+    """Поиск и заказ NFT-подарков Telegram по NFT, виду, цвету и цене."""
 
     strings = {"name": "NFT Search"}
+
+    def _error_text(self, error: str) -> str:
+        return (
+            f"{E_WARN} <b>Неожиданная ошибка :(</b>\n\n"
+            f"<blockquote>{utils.escape_html(error)}"
+            f" -> напиши @pureoffic с логом ошибки, "
+            f"и в скором времени она будет исправлена</blockquote>"
+        )
 
     def __init__(self):
         self._catalog_cache = {"ts": 0.0, "items": []}
@@ -102,11 +118,17 @@ class GiftFinderMod(loader.Module):
         self._color_cache = {"all": {"ts": 0.0, "items": []}, "by_gift": {}}
         self._color_tasks = {}
         self._sessions: Dict[str, dict] = {}
+        self._scan_lock = asyncio.Lock()
 
     async def client_ready(self):
+        self.orders = self.pointer("orders", [])
         self._prune_sessions()
         self._drop_remote_origin()
         self._prime_catalog()
+        self.scanner.start()
+
+    async def on_unload(self):
+        self.scanner.stop()
 
     def _drop_remote_origin(self):
         loaded = dict(self._db.get("LoaderMod", "loaded_modules", {}) or {})
@@ -117,7 +139,7 @@ class GiftFinderMod(loader.Module):
     async def snft(self, message: Message):
         """Открыть поиск NFT-подарков"""
         token = utils.rand(12)
-        self._sessions[token] = self._new_session()
+        self._sessions[token] = self._new_session("search")
         self._prime_catalog()
         self._prime_colors()
 
@@ -144,9 +166,183 @@ class GiftFinderMod(loader.Module):
             + f"\n\n{E_WARN} <b>Не удалось открыть inline-форму.</b>",
         )
 
-    def _new_session(self) -> dict:
+    @loader.command(ru_doc="— открыть форму заказа NFT")
+    async def znftcmd(self, message: Message):
+        """Open NFT order form"""
+        token = utils.rand(12)
+        self._sessions[token] = self._new_session("order")
+        self._prime_catalog()
+        self._prime_colors()
+
+        form = await self.inline.form(
+            "👀",
+            message=message,
+            reply_markup=self._filters_markup(token),
+            silent=True,
+        )
+
+        if form:
+            edit = getattr(form, "edit", None)
+            if callable(edit):
+                with contextlib.suppress(Exception):
+                    await edit(
+                        self._render_filters_text(token),
+                        reply_markup=self._filters_markup(token),
+                    )
+            return
+
+        await utils.answer(
+            message,
+            self._render_filters_text(token)
+            + f"\n\n{E_WARN} <b>Не удалось открыть inline-форму.</b>",
+        )
+
+    @loader.command(ru_doc="— список заказанных NFT")
+    async def listznftcmd(self, message: Message):
+        """List ordered NFTs"""
+        orders = list(self.orders)
+        if not orders:
+            await utils.answer(
+                message,
+                f"{E_LIST} <b>Список заказанных NFT</b>\n\n"
+                f"{E_NOTE} Тут ничего нет",
+            )
+            return
+
+        form = await self.inline.form(
+            "👀",
+            message=message,
+            reply_markup=[[_btn("закрыть", ID_CLOSE, action="close", style="danger")]],
+            silent=True,
+        )
+
+        if form and callable(getattr(form, "edit", None)):
+            with contextlib.suppress(Exception):
+                await form.edit(
+                    self._list_orders_text(orders),
+                    reply_markup=self._list_orders_markup(orders),
+                )
+            return
+
+        await utils.answer(
+            message,
+            f"{E_LIST} <b>Список заказанных NFT</b>\n\n"
+            f"{E_NOTE} Тут ничего нет",
+        )
+
+    def _list_orders_text(self, orders: list) -> str:
+        lines = [f"{E_LIST} <b>Список заказанных NFT</b>\n"]
+        for idx, order in enumerate(orders, 1):
+            gift_title = utils.escape_html(order.get("gift_title") or "любой NFT")
+            model_name = utils.escape_html(order.get("model_name") or "любой вид")
+            color = utils.escape_html(order.get("color_query") or "любой цвет")
+            max_price = order.get("max_price") or 0
+            price_text = f"{self._format_price(max_price)}" if max_price else "без лимита"
+            currency = self._currency_text(order.get("currency"))
+            status_icon = E_ORDER if order.get("status") == "found" else E_SEARCH
+            lines.append(
+                f"{status_icon} <b>{idx}.</b> "
+                f"NFT <code>{gift_title}</code> | "
+                f"вид <code>{model_name}</code>\n"
+                f"   цвет <code>{color}</code> | "
+                f"до <code>{price_text}</code> | "
+                f"{E_CURRENCY} <code>{utils.escape_html(currency)}</code>"
+            )
+        return "\n".join(lines)
+
+    def _list_orders_markup(self, orders: list) -> list:
+        rows = []
+        for i in range(0, len(orders), 2):
+            row = []
+            for j in range(i, min(i + 2, len(orders))):
+                order = orders[j]
+                status = "✔️ " if order.get("status") == "found" else ""
+                row.append(
+                    _btn(
+                        f"{status}{j + 1}",
+                        ID_SEARCH,
+                        callback=self._show_order_detail,
+                        args=(j,),
+                    )
+                )
+            rows.append(row)
+
+        rows.append([_btn("закрыть", ID_CLOSE, action="close", style="danger")])
+        return rows
+
+    async def _show_order_detail(self, call: InlineCall, index: int):
+        orders = list(self.orders)
+        idx = int(index)
+        if idx < 0 or idx >= len(orders):
+            await call.answer("заказ не найден", show_alert=True)
+            return
+
+        order = orders[idx]
+        gift_title = utils.escape_html(order.get("gift_title") or "любой NFT")
+        model_name = utils.escape_html(order.get("model_name") or "любой вид")
+        color = utils.escape_html(order.get("color_query") or "любой цвет")
+        max_price = order.get("max_price") or 0
+        price_text = f"<code>{self._format_price(max_price)}</code>" if max_price else "без лимита"
+        currency = self._currency_text(order.get("currency"))
+
+        lines = [
+            f"{E_SEARCH} <b>Заказ {idx + 1}:</b>",
+            "",
+            f"<blockquote>{E_NFT} <b>NFT:</b> <code>{gift_title}</code>",
+            f"{E_KIND} <b>Вид:</b> <code>{model_name}</code>",
+            f"{E_COLOR} <b>Цвет фона:</b> <code>{color}</code>",
+            f"{E_MONEY} <b>Макс цена:</b> {price_text}",
+            f"{E_CURRENCY} <b>Валюта</b>: {currency}</blockquote>",
+        ]
+
+        markup = [
+            [
+                _btn("назад", ID_BACK, callback=self._back_to_list, args=(), style="danger"),
+                _btn("удалить", ID_DEL, callback=self._delete_order, args=(idx,), style="danger"),
+            ],
+            [_btn("закрыть", ID_CLOSE, action="close", style="danger")],
+        ]
+
+        if order.get("found_nft"):
+            lines.append(f"\n{E_OK} Найден: {utils.escape_html(order['found_nft'])}")
+            markup.insert(0, [{"text": "Купить", "url": order["found_nft"]}])
+
+        await call.edit("\n".join(lines), reply_markup=markup)
+
+    async def _back_to_list(self, call: InlineCall):
+        orders = list(self.orders)
+        await call.edit(
+            self._list_orders_text(orders),
+            reply_markup=self._list_orders_markup(orders),
+        )
+
+    async def _delete_order(self, call: InlineCall, index: int):
+        orders = list(self.orders)
+        idx = int(index)
+        if idx < 0 or idx >= len(orders):
+            await call.answer("заказ не найден", show_alert=True)
+            return
+
+        orders.pop(idx)
+        self.orders = orders
+
+        if not orders:
+            await call.edit(
+                f"{E_LIST} <b>Список заказанных NFT</b>\n\n"
+                f"{E_NOTE} Тут ничего нет",
+                reply_markup=[[_btn("закрыть", ID_CLOSE, action="close", style="danger")]],
+            )
+            return
+
+        await call.edit(
+            self._list_orders_text(orders),
+            reply_markup=self._list_orders_markup(orders),
+        )
+
+    def _new_session(self, mode: str = "search") -> dict:
         return {
             "updated_at": time.time(),
+            "mode": mode,
             "color_query": "",
             "color_mode": "exact",
             "color_picker_query": "",
@@ -199,8 +395,10 @@ class GiftFinderMod(loader.Module):
     def _catalog_task_done(self, task: asyncio.Task):
         if task is self._catalog_task:
             self._catalog_task = None
-        with contextlib.suppress(Exception):
+        try:
             task.result()
+        except Exception as e:
+            logger.debug("_catalog_task_done: %s", e)
 
     async def _ensure_catalog(self) -> List[dict]:
         now = time.time()
@@ -215,51 +413,46 @@ class GiftFinderMod(loader.Module):
 
     async def _load_catalog(self) -> List[dict]:
         now = time.time()
-        response = await self._client(functions.payments.GetStarGiftsRequest(hash=0))
-        gifts = getattr(response, "gifts", []) or []
-        items = []
-        for gift in gifts:
-            gift_id = int(getattr(gift, "id", 0) or 0)
-            if not gift_id:
-                continue
-
-            title = (getattr(gift, "title", None) or f"gift {gift_id}").strip()
-            resale_count = int(getattr(gift, "availability_resale", 0) or 0)
-            items.append(
-                {
-                    "id": gift_id,
-                    "title": title,
-                    "resale_count": resale_count,
-                }
-            )
-
-        items.sort(key=lambda item: (item["title"].lower(), item["id"]))
-        self._catalog_cache = {"ts": now, "items": items}
-        return items
+        try:
+            response = await self._client(functions.payments.GetStarGiftsRequest(hash=0))
+            gifts = getattr(response, "gifts", []) or []
+            items = []
+            for gift in gifts:
+                gift_id = int(getattr(gift, "id", 0) or 0)
+                if not gift_id:
+                    continue
+                title = (getattr(gift, "title", None) or f"gift {gift_id}").strip()
+                resale_count = int(getattr(gift, "availability_resale", 0) or 0)
+                items.append(
+                    {
+                        "id": gift_id,
+                        "title": title,
+                        "resale_count": resale_count,
+                    }
+                )
+            items.sort(key=lambda item: (item["title"].lower(), item["id"]))
+            self._catalog_cache = {"ts": now, "items": items}
+            return items
+        except Exception as e:
+            logger.exception("_load_catalog")
+        self._catalog_cache = {"ts": now, "items": []}
+        return []
 
     def _filters_markup(self, token: str) -> list:
+        session = self._sessions.get(token) or {}
+        is_order = session.get("mode") == "order"
+        action_btn = (
+            _btn("заказать", ID_ORDER, style="success", callback=self._place_order, args=(token,))
+            if is_order
+            else _btn("искать", ID_SEARCH, style="success", callback=self._run_search, args=(token, 0, True))
+        )
         return [
             [
-                _btn(
-                    "цвет",
-                    ID_COLOR,
-                    callback=self._show_color_picker,
-                    args=(token, 0),
-                ),
-                _btn(
-                    "NFT",
-                    5260681660189408650,
-                    callback=self._show_type_picker,
-                    args=(token, 0),
-                ),
+                _btn("цвет", ID_COLOR, callback=self._show_color_picker, args=(token, 0)),
+                _btn("NFT", 5260681660189408650, callback=self._show_type_picker, args=(token, 0)),
             ],
             [
-                _btn(
-                    "вид",
-                    ID_KIND,
-                    callback=self._show_model_picker,
-                    args=(token, 0),
-                ),
+                _btn("вид", ID_KIND, callback=self._show_model_picker, args=(token, 0)),
                 _btn(
                     "цена",
                     ID_MONEY,
@@ -270,20 +463,8 @@ class GiftFinderMod(loader.Module):
             ],
             [self._currency_button(token)],
             [
-                _btn(
-                    "сбросить",
-                    ID_RESET,
-                    style="primary",
-                    callback=self._reset_filters,
-                    args=(token,),
-                ),
-                _btn(
-                    "искать",
-                    ID_SEARCH,
-                    style="success",
-                    callback=self._run_search,
-                    args=(token, 0, True),
-                ),
+                _btn("сбросить", ID_RESET, style="primary", callback=self._reset_filters, args=(token,)),
+                action_btn,
             ],
             [_btn("закрыть", ID_CLOSE, action="close", style="danger")],
         ]
@@ -312,6 +493,18 @@ class GiftFinderMod(loader.Module):
         max_price = session.get("max_price") or 0
         price_text = f"<code>{self._format_price(max_price)}</code>" if max_price else "без лимита"
         currency = self._currency_text(session.get("currency"))
+        is_order = session.get("mode") == "order"
+
+        if is_order:
+            return (
+                f"{E_KIND} <b>Составить заказ на NFT</b>\n"
+                f"{E_CHAT} <b>Максимум 10 заказов</b>\n\n"
+                f"<blockquote>{E_NFT} <b>NFT:</b> <code>{gift_title}</code>\n"
+                f"{E_KIND} <b>Вид:</b> <code>{model_name}</code>\n"
+                f"{E_COLOR} <b>Цвет фона:</b> <code>{color}</code>\n"
+                f"{E_MONEY} <b>Макс цена:</b> {price_text}\n"
+                f"{E_CURRENCY} <b>Валюта</b>: {currency}</blockquote>"
+            )
 
         return (
             f"{E_WORLD} <b>Поиск NFT-подарков</b>\n\n"
@@ -393,7 +586,8 @@ class GiftFinderMod(loader.Module):
             await call.answer("сессия поиска уже протухла", show_alert=True)
             return
 
-        self._sessions[token] = self._new_session()
+        old_mode = self._sessions[token].get("mode", "search")
+        self._sessions[token] = self._new_session(old_mode)
         self._prime_colors()
         await self._refresh_filters(call, token)
 
@@ -408,39 +602,42 @@ class GiftFinderMod(loader.Module):
         if entry["ts"] and time.time() - entry["ts"] < ATTR_CACHE_TTL:
             return entry
 
-        response = await self._client(
-            functions.payments.GetStarGiftUpgradeAttributesRequest(gift_id=int(gift_id))
-        )
+        with contextlib.suppress(Exception):
+            response = await self._client(
+                functions.payments.GetStarGiftUpgradeAttributesRequest(gift_id=int(gift_id))
+            )
 
-        backdrops = []
-        models = []
-        seen_backdrops = set()
-        seen_models = set()
+            backdrops = []
+            models = []
+            seen_backdrops = set()
+            seen_models = set()
 
-        for attr in getattr(response, "attributes", []) or []:
-            if isinstance(attr, types.StarGiftAttributeBackdrop):
-                name = (getattr(attr, "name", None) or "").strip()
-                backdrop_id = int(getattr(attr, "backdrop_id", 0) or 0)
-                key = (self._normalize_text(name), backdrop_id)
-                if not name or key in seen_backdrops:
+            for attr in getattr(response, "attributes", []) or []:
+                attr_type = type(attr).__name__
+                if attr_type == "StarGiftAttributeBackdrop":
+                    name = (getattr(attr, "name", None) or "").strip()
+                    backdrop_id = int(getattr(attr, "backdrop_id", 0) or 0)
+                    key = (self._normalize_text(name), backdrop_id)
+                    if not name or key in seen_backdrops:
+                        continue
+                    seen_backdrops.add(key)
+                    backdrops.append({"name": name, "backdrop_id": backdrop_id})
                     continue
-                seen_backdrops.add(key)
-                backdrops.append({"name": name, "backdrop_id": backdrop_id})
-                continue
 
-            if isinstance(attr, types.StarGiftAttributeModel):
-                name = (getattr(attr, "name", None) or "").strip()
-                document = getattr(attr, "document", None)
-                model_id = int(getattr(document, "id", 0) or 0)
-                key = (self._normalize_text(name), model_id)
-                if not name or not model_id or key in seen_models:
-                    continue
-                seen_models.add(key)
-                models.append({"name": name, "model_id": model_id})
+                if attr_type == "StarGiftAttributeModel":
+                    name = (getattr(attr, "name", None) or "").strip()
+                    document = getattr(attr, "document", None)
+                    model_id = int(getattr(document, "id", 0) or 0)
+                    key = (self._normalize_text(name), model_id)
+                    if not name or not model_id or key in seen_models:
+                        continue
+                    seen_models.add(key)
+                    models.append({"name": name, "model_id": model_id})
 
-        backdrops.sort(key=lambda item: self._normalize_text(item["name"]))
-        models.sort(key=lambda item: self._normalize_text(item["name"]))
-        entry.update({"ts": time.time(), "backdrops": backdrops, "models": models})
+            backdrops.sort(key=lambda item: self._normalize_text(item["name"]))
+            models.sort(key=lambda item: self._normalize_text(item["name"]))
+            entry.update({"ts": time.time(), "backdrops": backdrops, "models": models})
+
         return entry
 
     def _get_cached_backdrops(
@@ -641,13 +838,7 @@ class GiftFinderMod(loader.Module):
             rows.append(nav)
         rows.append(
             [
-                _btn(
-                    "к фильтрам",
-                    ID_FOLDER,
-                    callback=self._refresh_filters,
-                    args=(token,),
-                    style="primary",
-                ),
+                _btn("к фильтрам", ID_FOLDER, callback=self._refresh_filters, args=(token,), style="primary"),
                 _btn("закрыть", ID_CLOSE, action="close", style="danger"),
             ]
         )
@@ -724,6 +915,7 @@ class GiftFinderMod(loader.Module):
         try:
             models = cached_models or await self._ensure_models(int(gift_id))
         except Exception as e:
+            logger.exception("_show_model_picker")
             await call.answer(
                 f"не удалось получить виды: {utils.escape_html(str(e))[:120]}",
                 show_alert=True,
@@ -787,13 +979,7 @@ class GiftFinderMod(loader.Module):
             rows.append(nav)
         rows.append(
             [
-                _btn(
-                    "к фильтрам",
-                    ID_FOLDER,
-                    callback=self._refresh_filters,
-                    args=(token,),
-                    style="primary",
-                ),
+                _btn("к фильтрам", ID_FOLDER, callback=self._refresh_filters, args=(token,), style="primary"),
                 _btn("закрыть", ID_CLOSE, action="close", style="danger"),
             ]
         )
@@ -875,6 +1061,7 @@ class GiftFinderMod(loader.Module):
         try:
             colors = cached_colors or await self._ensure_colors(gift_id)
         except Exception as e:
+            logger.exception("_show_color_picker")
             await call.answer(
                 f"не удалось получить список цветов: {utils.escape_html(str(e))[:120]}",
                 show_alert=True,
@@ -940,13 +1127,7 @@ class GiftFinderMod(loader.Module):
             rows.append(nav)
         rows.append(
             [
-                _btn(
-                    "к фильтрам",
-                    ID_FOLDER,
-                    callback=self._refresh_filters,
-                    args=(token,),
-                    style="primary",
-                ),
+                _btn("к фильтрам", ID_FOLDER, callback=self._refresh_filters, args=(token,), style="primary"),
                 _btn("закрыть", ID_CLOSE, action="close", style="danger"),
             ]
         )
@@ -1033,18 +1214,12 @@ class GiftFinderMod(loader.Module):
         try:
             await self._ensure_results(session, needed)
         except Exception as e:
+            logger.exception("_run_search")
             await call.edit(
-                f"{E_WARN} <b>Поиск не удался</b>\n\n"
-                f"<code>{utils.escape_html(str(e))}</code>",
+                self._error_text(str(e)),
                 reply_markup=[
                     [
-                        _btn(
-                            "к фильтрам",
-                            ID_FOLDER,
-                            callback=self._refresh_filters,
-                            args=(token,),
-                            style="primary",
-                        ),
+                        _btn("к фильтрам", ID_FOLDER, callback=self._refresh_filters, args=(token,), style="primary"),
                         _btn("закрыть", ID_CLOSE, action="close", style="danger"),
                     ]
                 ],
@@ -1069,20 +1244,8 @@ class GiftFinderMod(loader.Module):
                 self._render_no_results_text(session),
                 reply_markup=[
                     [
-                        _btn(
-                            "к фильтрам",
-                            ID_FOLDER,
-                            callback=self._refresh_filters,
-                            args=(token,),
-                            style="primary",
-                        ),
-                        _btn(
-                            "ещё раз",
-                            ID_REFRESH,
-                            callback=self._run_search,
-                            args=(token, 0, True),
-                            style="success",
-                        ),
+                        _btn("к фильтрам", ID_FOLDER, callback=self._refresh_filters, args=(token,), style="primary"),
+                        _btn("ещё раз", ID_REFRESH, callback=self._run_search, args=(token, 0, True), style="success"),
                     ],
                     [_btn("закрыть", ID_CLOSE, action="close", style="danger")],
                 ],
@@ -1128,28 +1291,11 @@ class GiftFinderMod(loader.Module):
 
         markup = [
             [
-                _btn(
-                    "другое",
-                    ID_NEXT,
-                    callback=self._next_page,
-                    args=(token,),
-                )
+                _btn("другое", ID_NEXT, callback=self._next_page, args=(token,))
             ],
             [
-                _btn(
-                    "к фильтрам",
-                    ID_FOLDER,
-                    callback=self._refresh_filters,
-                    args=(token,),
-                    style="primary",
-                ),
-                _btn(
-                    "обновить",
-                    ID_REFRESH,
-                    callback=self._run_search,
-                    args=(token, 0, True),
-                    style="success",
-                ),
+                _btn("к фильтрам", ID_FOLDER, callback=self._refresh_filters, args=(token,), style="primary"),
+                _btn("обновить", ID_REFRESH, callback=self._run_search, args=(token, 0, True), style="success"),
             ],
             [_btn("закрыть", ID_CLOSE, action="close", style="danger")],
         ]
@@ -1353,11 +1499,6 @@ class GiftFinderMod(loader.Module):
             "limit": RESALE_FETCH_LIMIT,
             "sort_by_price": True,
         }
-        if (
-            self._normalize_currency(session.get("currency")) == "stars"
-            and RESALE_SUPPORTS_STARS_ONLY
-        ):
-            request_kwargs["stars_only"] = True
 
         attrs = []
         if state.get("backdrop_id") is not None:
@@ -1462,13 +1603,13 @@ class GiftFinderMod(loader.Module):
 
     def _extract_backdrop_name(self, gift) -> str:
         for attr in getattr(gift, "attributes", []) or []:
-            if isinstance(attr, types.StarGiftAttributeBackdrop):
+            if type(attr).__name__ == "StarGiftAttributeBackdrop":
                 return (getattr(attr, "name", None) or "").strip()
         return ""
 
     def _extract_model_info(self, gift) -> tuple:
         for attr in getattr(gift, "attributes", []) or []:
-            if isinstance(attr, types.StarGiftAttributeModel):
+            if type(attr).__name__ == "StarGiftAttributeModel":
                 name = (getattr(attr, "name", None) or "").strip()
                 document = getattr(attr, "document", None)
                 model_id = int(getattr(document, "id", 0) or 0)
@@ -1533,10 +1674,16 @@ class GiftFinderMod(loader.Module):
                 if min_stars is not None:
                     return float(min_stars), "stars"
 
+            with contextlib.suppress(Exception):
+                offer_min = getattr(gift, "offer_min_stars", None)
+                if offer_min is not None:
+                    return float(offer_min), "stars"
+
         return None
 
     def _amount_currency(self, amount) -> str:
-        if isinstance(amount, types.StarsTonAmount):
+        name = type(amount).__name__
+        if "TON" in name.upper() or "Ton" in name:
             return "ton"
         return "stars"
 
@@ -1560,3 +1707,344 @@ class GiftFinderMod(loader.Module):
 
     def _normalize_text(self, value: Optional[str]) -> str:
         return " ".join((value or "").strip().lower().split())
+
+    async def _place_order(self, call: InlineCall, token: str):
+        session = self._touch_session(token)
+        if not session:
+            await call.answer("сессия протухла", show_alert=True)
+            return
+
+        orders = list(self.orders)
+        if len(orders) >= MAX_ORDERS:
+            await call.answer(f"максимум {MAX_ORDERS} заказов", show_alert=True)
+            return
+
+        user_id = int(call.from_user.id) if call.from_user else self.tg_id
+
+        order = {
+            "id": utils.rand(12),
+            "user_id": user_id,
+            "gift_id": session.get("gift_id"),
+            "gift_title": session.get("gift_title") or "",
+            "model_id": session.get("model_id"),
+            "model_name": session.get("model_name") or "",
+            "color_query": session.get("color_query") or "",
+            "color_mode": session.get("color_mode") or "exact",
+            "max_price": session.get("max_price") or 0,
+            "currency": self._normalize_currency(session.get("currency")),
+            "status": "active",
+            "found_nft": None,
+            "seen_slugs": [],
+            "created_at": time.time(),
+        }
+
+        await call.edit(
+            f"{E_SEARCH} <b>Проверяю, есть ли уже такой NFT...</b>",
+            reply_markup=[[_btn("закрыть", ID_CLOSE, action="close", style="danger")]],
+        )
+
+        existing = await self._find_immediate_match(order)
+        if existing:
+            order["status"] = "pending_buy"
+            order["found_nft"] = existing["url"]
+            session["_pending_order"] = order
+
+            await call.edit(
+                f"{E_ORDER} <b>Такой NFT уже есть, покупаешь?</b>\n\n"
+                f"{self._format_order_filter(order)}\n\n"
+                f"{E_LINK} {utils.escape_html(existing['url'])}",
+                reply_markup=[
+                    [{"text": "Купить", "url": existing["url"]}],
+                    [
+                        _btn("заказать отслеживание", ID_ORDER, callback=self._save_order, args=(token,), style="success"),
+                        _btn("закрыть", ID_CLOSE, action="close", style="danger"),
+                    ],
+                ],
+            )
+            return
+
+        self.orders = orders + [order]
+        self._sessions.pop(token, None)
+
+        await call.edit(
+            f"{E_ORDER} <b>Заказ размещён!</b>\n\n"
+            f"{self._format_order_filter(order)}\n\n"
+            f"{E_INFO} <i>Я отслеживаю новые NFT и сообщу когда найдётся подходящий.</i>",
+            reply_markup=[[_btn("закрыть", ID_CLOSE, action="close", style="danger")]],
+        )
+
+    async def _save_order(self, call: InlineCall, token: str):
+        session = self._touch_session(token)
+        if not session:
+            await call.answer("сессия протухла", show_alert=True)
+            return
+
+        order = session.get("_pending_order")
+        if not order:
+            await call.answer("заказ не найден", show_alert=True)
+            return
+
+        order["status"] = "active"
+        order["found_nft"] = None
+        orders = list(self.orders)
+        orders.append(order)
+        self.orders = orders
+        self._sessions.pop(token, None)
+
+        await call.edit(
+            f"{E_ORDER} <b>Заказ размещён!</b>\n\n"
+            f"{self._format_order_filter(order)}\n\n"
+            f"{E_INFO} <i>Я отслеживаю новые NFT и сообщу когда найдётся подходящий.</i>",
+            reply_markup=[[_btn("закрыть", ID_CLOSE, action="close", style="danger")]],
+        )
+
+    def _format_order_filter(self, order: dict) -> str:
+        parts = []
+        parts.append(f"{E_NFT} <b>NFT:</b> <code>{utils.escape_html(order.get('gift_title') or 'любой NFT')}</code>")
+        parts.append(f"{E_KIND} <b>Вид:</b> <code>{utils.escape_html(order.get('model_name') or 'любой вид')}</code>")
+        parts.append(f"{E_COLOR} <b>Цвет фона:</b> <code>{utils.escape_html(order.get('color_query') or 'любой цвет')}</code>")
+        max_price = order.get("max_price") or 0
+        price_text = f"<code>{self._format_price(max_price)}</code>" if max_price else "без лимита"
+        parts.append(f"{E_MONEY} <b>Макс цена:</b> {price_text}")
+        parts.append(f"{E_CURRENCY} <b>Валюта</b>: {self._currency_text(order.get('currency'))}")
+        return "<blockquote>" + "\n".join(parts) + "</blockquote>"
+
+    async def _find_immediate_match(self, order: dict) -> Optional[dict]:
+        candidates = await self._get_order_candidates(order)
+        if not candidates:
+            return None
+
+        candidates = candidates[:5]
+
+        semaphore = asyncio.Semaphore(SCAN_BATCH_SIZE)
+
+        async def _scan(item: dict):
+            async with semaphore:
+                state = {
+                    "gift_id": int(item["id"]),
+                    "title": item["title"],
+                    "next_offset": "",
+                    "finished": False,
+                    "pages_done": 0,
+                    "backdrop_id": item.get("exact_backdrop_id"),
+                }
+                found = []
+                while not state["finished"] and len(found) < 1 and state["pages_done"] < 2:
+                    try:
+                        result = await self._fetch_order_page(order, state)
+                        if result:
+                            found.extend(result)
+                    except Exception as e:
+                        logger.debug("_find_immediate_match scan: %s", e)
+                    state["pages_done"] += 1
+                    state["finished"] = not state["next_offset"]
+                return found
+
+        with contextlib.suppress(asyncio.TimeoutError):
+            results = await asyncio.wait_for(
+                asyncio.gather(*(_scan(item) for item in candidates), return_exceptions=True),
+                timeout=20,
+            )
+            all_found = []
+            for batch in (results or []):
+                if isinstance(batch, list):
+                    all_found.extend(batch)
+
+            all_found.sort(key=lambda item: (
+                self._currency_rank(item.get("price_currency")),
+                item["price_value"],
+            ))
+            return all_found[0] if all_found else None
+
+        return None
+
+    async def _get_order_candidates(self, order: dict) -> List[dict]:
+        catalog = await self._ensure_catalog()
+        candidates = [
+            item
+            for item in catalog
+            if (not order.get("gift_id") or int(item["id"]) == int(order["gift_id"]))
+        ][:15]
+
+        exact_color = order.get("color_query") if order.get("color_query") else ""
+        if exact_color:
+            target = self._normalize_text(exact_color)
+            semaphore = asyncio.Semaphore(DISCOVERY_BATCH_SIZE)
+
+            async def _resolve(item: dict) -> Optional[dict]:
+                async with semaphore:
+                    with contextlib.suppress(Exception):
+                        for backdrop in await self._ensure_backdrops(int(item["id"])):
+                            if self._normalize_text(backdrop["name"]) == target:
+                                enriched = dict(item)
+                                enriched["exact_backdrop_id"] = int(backdrop["backdrop_id"])
+                                return enriched
+                return None
+
+            resolved = await asyncio.gather(*(_resolve(item) for item in candidates), return_exceptions=True)
+            candidates = [item for item in resolved if item and not isinstance(item, BaseException)]
+
+        candidates.sort(key=lambda item: (-int(item.get("resale_count", 0) or 0), item["title"].lower()))
+        return candidates
+
+    async def _fetch_order_page(self, order: dict, state: dict) -> List[dict]:
+        request_kwargs = {
+            "gift_id": state["gift_id"],
+            "offset": state["next_offset"] or "",
+            "limit": RESALE_FETCH_LIMIT,
+            "sort_by_price": True,
+        }
+
+        attrs = []
+        if state.get("backdrop_id") is not None:
+            attrs.append(types.StarGiftAttributeIdBackdrop(backdrop_id=int(state["backdrop_id"])))
+        if order.get("model_id") is not None:
+            attrs.append(types.StarGiftAttributeIdModel(document_id=int(order["model_id"])))
+        if attrs:
+            request_kwargs["attributes"] = attrs
+
+        response = await self._client(
+            functions.payments.GetResaleStarGiftsRequest(**request_kwargs)
+        )
+
+        gifts = getattr(response, "gifts", []) or []
+        state["next_offset"] = getattr(response, "next_offset", None) or ""
+
+        results = []
+        for gift in gifts:
+            entry = self._parse_order_listing(order, state["title"], gift)
+            if entry:
+                results.append(entry)
+
+        return results
+
+    def _parse_order_listing(self, order: dict, fallback_title: str, gift) -> Optional[dict]:
+        slug = getattr(gift, "slug", None) or ""
+        if not slug:
+            return None
+
+        title = (getattr(gift, "title", None) or fallback_title or "").strip() or fallback_title
+        if order.get("gift_title") and title != order["gift_title"]:
+            return None
+
+        model_name, model_id = self._extract_model_info(gift)
+        if order.get("model_id") and int(model_id or 0) != int(order["model_id"]):
+            return None
+
+        backdrop_name = self._extract_backdrop_name(gift)
+        if not self._match_color(order, backdrop_name):
+            return None
+
+        price = self._extract_price(gift, order.get("currency"))
+        if price is None:
+            return None
+
+        price_value, price_currency = price
+        max_price = float(order.get("max_price") or 0)
+        if max_price and price_value > max_price:
+            return None
+
+        return {
+            "slug": slug,
+            "title": title,
+            "model_name": model_name,
+            "model_id": model_id,
+            "backdrop_name": backdrop_name,
+            "price_value": price_value,
+            "price_currency": price_currency,
+            "price_text": self._format_price(price_value),
+            "price_unit": self._price_unit(price_currency),
+            "url": f"https://t.me/nft/{slug}",
+        }
+
+    @loader.loop(interval=SCAN_INTERVAL, autostart=False, wait_before=True)
+    async def scanner(self):
+        async with self._scan_lock:
+            orders = list(self.orders)
+            if not orders:
+                return
+
+            changed = False
+            for order in orders:
+                if order.get("status") != "active":
+                    continue
+
+                with contextlib.suppress(Exception):
+                    found = await asyncio.wait_for(self._scan_order(order), timeout=25)
+                    if found:
+                        order["status"] = "found"
+                        order["found_nft"] = found["url"]
+                        changed = True
+                        await self._notify_found(order, found)
+
+            if changed:
+                self.orders = orders
+
+    async def _scan_order(self, order: dict) -> Optional[dict]:
+        candidates = await self._get_order_candidates(order)
+        if not candidates:
+            return None
+
+        candidates = candidates[:5]
+        seen = set(order.get("seen_slugs", []))
+
+        semaphore = asyncio.Semaphore(SCAN_BATCH_SIZE)
+
+        async def _scan(item: dict):
+            async with semaphore:
+                state = {
+                    "gift_id": int(item["id"]),
+                    "title": item["title"],
+                    "next_offset": "",
+                    "finished": False,
+                    "pages_done": 0,
+                    "backdrop_id": item.get("exact_backdrop_id"),
+                }
+                found = []
+                while not state["finished"] and state["pages_done"] < 2:
+                    try:
+                        result = await self._fetch_order_page(order, state)
+                        if result:
+                            for entry in result:
+                                if entry["slug"] not in seen:
+                                    found.append(entry)
+                    except Exception as e:
+                        logger.debug("_scan_order scan: %s", e)
+                    state["pages_done"] += 1
+                    state["finished"] = not state["next_offset"]
+                return found
+
+        results = await asyncio.gather(*(_scan(item) for item in candidates), return_exceptions=True)
+        all_found = []
+        for batch in (results or []):
+            if isinstance(batch, list):
+                all_found.extend(batch)
+
+        all_found.sort(key=lambda item: (
+            self._currency_rank(item.get("price_currency")),
+            item["price_value"],
+        ))
+
+        new_seen = list(seen)
+        for entry in all_found:
+            if entry["slug"] not in new_seen:
+                new_seen.append(entry["slug"])
+        order["seen_slugs"] = new_seen[-200:]
+
+        return all_found[0] if all_found else None
+
+    async def _notify_found(self, order: dict, found: dict):
+        try:
+            text = (
+                f"{E_ORDER} <b>СРОЧНО!</b>\n\n"
+                f"{E_OK} <b>NFT найден:</b>\n"
+                f"{self._format_order_filter(order)}\n\n"
+                f"{E_LINK} {utils.escape_html(found['url'])}"
+            )
+            await self._client.send_message(
+                int(order["user_id"]),
+                text,
+                buttons=[[Button.url("Офер (купить)", found["url"])]],
+            )
+        except Exception as e:
+            logger.exception("_notify_found")
